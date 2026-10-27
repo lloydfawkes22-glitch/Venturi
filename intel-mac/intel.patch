@@ -1,8 +1,8 @@
 diff --git a/crates/vv-app/src/main.rs b/crates/vv-app/src/main.rs
-index 12e0228..aca7137 100644
+index 17be536..79a1773 100644
 --- a/crates/vv-app/src/main.rs
 +++ b/crates/vv-app/src/main.rs
-@@ -4966,19 +4966,30 @@ fn main() -> eframe::Result<()> {
+@@ -4797,19 +4797,22 @@ fn main() -> eframe::Result<()> {
          viewport = viewport.with_icon(icon);
      }
  
@@ -14,16 +14,8 @@ index 12e0228..aca7137 100644
 +        }),
 +        ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
 +    };
-+    // Metal's compiler on old Intel Macs (Big Sur) aborts on wgpu's
-+    // indirect-call validation shaders and the device is lost before the
-+    // window opens. Venturi issues no indirect calls.
-+    // WGPU_VALIDATION_INDIRECT_CALL=1 still turns it back on.
-+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-+        let flags = &mut wgpu_setup.instance_descriptor.flags;
-+        *flags = flags
-+            .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
-+            .with_env();
-+    }
++    wgpu_setup.instance_descriptor.flags =
++        vv_render::instance_flags(wgpu_setup.instance_descriptor.flags);
 +
      let options = eframe::NativeOptions {
          renderer: eframe::Renderer::Wgpu,
@@ -42,6 +34,55 @@ index 12e0228..aca7137 100644
              ..Default::default()
          },
          ..Default::default()
+diff --git a/crates/vv-render/src/compositor.rs b/crates/vv-render/src/compositor.rs
+index 95c31af..b0189a4 100644
+--- a/crates/vv-render/src/compositor.rs
++++ b/crates/vv-render/src/compositor.rs
+@@ -949,6 +949,19 @@ fn work_format(precision: ProcessingPrecision, float_work: bool) -> wgpu::Textur
+ /// wgpu refuses a device asking for more than the adapter offers, and the
+ /// defaults exceed small GPUs (Raspberry Pi 4: 4 color attachments, 4096
+ /// textures on GL).
++/// Metal's compiler on old Intel Macs (Big Sur) aborts on wgpu's indirect-call
++/// validation shaders and the device is lost. Venturi issues no indirect calls;
++/// WGPU_VALIDATION_INDIRECT_CALL=1 still turns it back on.
++pub fn instance_flags(flags: wgpu::InstanceFlags) -> wgpu::InstanceFlags {
++    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
++        flags
++            .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
++            .with_env()
++    } else {
++        flags
++    }
++}
++
+ pub fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
+     wgpu::Limits {
+         max_texture_dimension_2d: 8192,
+@@ -1196,7 +1209,10 @@ impl Compositor {
+     /// for the app today and for the tests.
+     pub fn new_headless_with_precision(precision: ProcessingPrecision) -> Self {
+         let (adapter, (device, queue)) = pollster::block_on(async {
+-            let instance = wgpu::Instance::default();
++            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
++                flags: instance_flags(wgpu::InstanceFlags::default()),
++                ..wgpu::InstanceDescriptor::new_without_display_handle()
++            });
+             let adapter = instance
+                 .request_adapter(&wgpu::RequestAdapterOptions::default())
+                 .await
+diff --git a/crates/vv-render/src/lib.rs b/crates/vv-render/src/lib.rs
+index ef3cfb0..45a107e 100644
+--- a/crates/vv-render/src/lib.rs
++++ b/crates/vv-render/src/lib.rs
+@@ -8,7 +8,7 @@ pub mod text;
+ 
+ pub use compositor::{
+     Compositor, Layer, LayerContent, OutputFrame, PooledTexture, YuvChroma, YuvFrame,
+-    device_limits, fit_output_size,
++    device_limits, fit_output_size, instance_flags,
+ };
+ pub use scopes::{ScopeKind, Scopes};
+ /// Re-exported: whoever owns a texture for `LayerContent::Texture` must use the
 diff --git a/scripts/build-macos.sh b/scripts/build-macos.sh
 index 5c68025..34349fd 100755
 --- a/scripts/build-macos.sh
