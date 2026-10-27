@@ -84,7 +84,7 @@ jobs:
         with:
           workspaces: src
 
-      - uses: actions/cache@v6
+      - uses: actions/cache/restore@v6
         with:
           path: src/target/ffmpeg-shared
           key: ffmpeg-intel-bigsur-${{ hashFiles('src/scripts/build-ffmpeg.sh') }}
@@ -93,15 +93,35 @@ jobs:
         working-directory: src
         run: scripts/build-macos.sh
 
+      # Saved right away: FFmpeg takes most of the build, keep it even if a later step fails.
+      - uses: actions/cache/save@v6
+        if: always()
+        with:
+          path: src/target/ffmpeg-shared
+          key: ffmpeg-intel-bigsur-${{ hashFiles('src/scripts/build-ffmpeg.sh') }}
+
       - name: Check architecture and minimum macOS
         working-directory: src
         run: |
+          bad=0
           for f in target/macos/Venturi.app/Contents/MacOS/vv-app target/macos/Venturi.app/Contents/Frameworks/*.dylib; do
-            [ "$(lipo -archs "$f")" = x86_64 ] || { echo "::error::$f is not x86_64"; exit 1; }
-            minos=$(vtool -show-build "$f" | awk '/minos/ { print $2 }')
-            echo "$(basename "$f"): minos $minos"
-            [ "${minos%%.*}" -le 11 ] || { echo "::error::$f needs macOS $minos"; exit 1; }
+            name=$(basename "$f")
+            archs=$(lipo -archs "$f" 2>&1)
+            # LC_BUILD_VERSION (minos) or, for older binaries, LC_VERSION_MIN_MACOSX (version).
+            minos=$(otool -l "$f" | awk '
+              /LC_BUILD_VERSION|LC_VERSION_MIN_MACOSX/ { cmd = $2 }
+              cmd == "LC_BUILD_VERSION" && $1 == "minos" { print $2; exit }
+              cmd == "LC_VERSION_MIN_MACOSX" && $1 == "version" { print $2; exit }')
+            echo "::notice title=$name::arch $archs, minos ${minos:-unknown}"
+            if [ "$archs" != x86_64 ]; then
+              echo "::error title=$name::not x86_64 ($archs)"; bad=1
+            fi
+            major=${minos%%.*}
+            if [ -z "$major" ] || [ "$major" -gt 11 ]; then
+              echo "::error title=$name::needs macOS ${minos:-unknown}"; bad=1
+            fi
           done
+          exit $bad
 
       - name: Publish
         working-directory: src
