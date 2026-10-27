@@ -1,0 +1,117 @@
+name: Venturi Intel
+
+# Builds the latest official Venturi release for Intel Macs (macOS 11+) with
+# the changes in intel-mac/intel.patch, and publishes the dmg as a release
+# of this fork. Daily, or by hand from the Actions tab.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Official version to build, e.g. v0.8.1 (empty = latest)"
+        required: false
+        default: ""
+      force:
+        description: "Rebuild even if this version is already published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: venturi-intel
+
+env:
+  UPSTREAM: https://github.com/VenturiVideo/Venturi.git
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      build: ${{ steps.pick.outputs.build }}
+    steps:
+      - id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          tag="$VERSION"
+          if [ -z "$tag" ]; then
+            tag=$(git ls-remote --tags --refs "$UPSTREAM" 'v*' \
+              | sed 's#.*refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          fi
+          [ -n "$tag" ] || { echo "::error::no official version found"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != true ] && gh release view "$tag-intel" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "$tag-intel is already published"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Building $tag"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15-intel
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: fork
+
+      - name: Official source with the Intel changes
+        run: |
+          git clone --depth 1 --branch "$TAG" "$UPSTREAM" src
+          cd src
+          git apply --verbose ../fork/intel-mac/intel.patch || {
+            echo "::error::intel-mac/intel.patch no longer applies to $TAG: it needs updating"
+            exit 1
+          }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # nasm: x264 and FFmpeg need it for their x86 assembly.
+      - name: Install build tools
+        run: brew install pkgconf meson ninja nasm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src
+
+      - uses: actions/cache@v6
+        with:
+          path: src/target/ffmpeg-shared
+          key: ffmpeg-intel-bigsur-${{ hashFiles('src/scripts/build-ffmpeg.sh') }}
+
+      - name: Build
+        working-directory: src
+        run: scripts/build-macos.sh
+
+      - name: Check architecture and minimum macOS
+        working-directory: src
+        run: |
+          for f in target/macos/Venturi.app/Contents/MacOS/vv-app target/macos/Venturi.app/Contents/Frameworks/*.dylib; do
+            [ "$(lipo -archs "$f")" = x86_64 ] || { echo "::error::$f is not x86_64"; exit 1; }
+            minos=$(vtool -show-build "$f" | awk '/minos/ { print $2 }')
+            echo "$(basename "$f"): minos $minos"
+            [ "${minos%%.*}" -le 11 ] || { echo "::error::$f needs macOS $minos"; exit 1; }
+          done
+
+      - name: Publish
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dmg="target/macos/Venturi-$TAG-intel.dmg"
+          mv target/macos/Venturi-x86_64.dmg "$dmg"
+          gh release delete "$TAG-intel" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG-intel" "$dmg" -R "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Venturi $TAG for Intel Macs" \
+            --notes "Official Venturi $TAG built for Intel Macs, macOS 11 Big Sur and later, with intel-mac/intel.patch applied. Unofficial build."
