@@ -16,7 +16,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install build tools
-        run: brew install pkgconf meson ninja
+        # nasm: x264 and FFmpeg need it for their x86 assembly.
+        run: brew install pkgconf meson ninja nasm
 
       - uses: Swatinem/rust-cache@v2
 
