@@ -1,9 +1,11 @@
 name: macOS Intel
 
-# Intel build (x86_64, macOS 11 Big Sur and later). Run manually from the
-# Actions tab; the dmg is left as an artifact of the run.
+# Intel build (x86_64, macOS 11 Big Sur and later); the dmg is left as an
+# artifact of the run.
 on:
   workflow_dispatch:
+  push:
+    branches: [macos-intel]
 
 jobs:
   macos-intel:
