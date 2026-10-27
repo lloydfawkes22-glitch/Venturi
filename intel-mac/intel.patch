@@ -1,8 +1,18 @@
 diff --git a/crates/vv-app/src/main.rs b/crates/vv-app/src/main.rs
-index 17be536..79a1773 100644
+index 17be536..e5f572d 100644
 --- a/crates/vv-app/src/main.rs
 +++ b/crates/vv-app/src/main.rs
-@@ -4797,19 +4797,22 @@ fn main() -> eframe::Result<()> {
+@@ -1892,6 +1892,9 @@ impl VenturiApp {
+         let (Some(render_state), Some(source)) = (self.egui_render_state.clone(), source) else {
+             return;
+         };
++        if !vv_render::compute_supported(&render_state.device) {
++            return;
++        }
+         let scopes = self.scopes.get_or_insert_with(|| {
+             vv_render::Scopes::new(
+                 std::sync::Arc::new(render_state.device.clone()),
+@@ -4797,19 +4800,22 @@ fn main() -> eframe::Result<()> {
          viewport = viewport.with_icon(icon);
      }
  
@@ -35,10 +45,19 @@ index 17be536..79a1773 100644
          },
          ..Default::default()
 diff --git a/crates/vv-render/src/compositor.rs b/crates/vv-render/src/compositor.rs
-index 95c31af..b0189a4 100644
+index 95c31af..6e3d2c8 100644
 --- a/crates/vv-render/src/compositor.rs
 +++ b/crates/vv-render/src/compositor.rs
-@@ -949,6 +949,19 @@ fn work_format(precision: ProcessingPrecision, float_work: bool) -> wgpu::Textur
+@@ -850,7 +850,7 @@ pub struct Compositor {
+     resolve_pipeline: wgpu::RenderPipeline,
+     bind_group_layout: wgpu::BindGroupLayout,
+     sampler: wgpu::Sampler,
+-    i420_pipeline: wgpu::ComputePipeline,
++    i420_pipeline: Option<wgpu::ComputePipeline>,
+     /// Textures reused from one frame to the next, by size: allocating new
+     /// ones on every frame costs more than the drawing itself.
+     pool: Mutex<TexturePool>,
+@@ -949,6 +949,109 @@ fn work_format(precision: ProcessingPrecision, float_work: bool) -> wgpu::Textur
  /// wgpu refuses a device asking for more than the adapter offers, and the
  /// defaults exceed small GPUs (Raspberry Pi 4: 4 color attachments, 4096
  /// textures on GL).
@@ -55,10 +74,126 @@ index 95c31af..b0189a4 100644
 +    }
 +}
 +
++/// Whether `device` can build compute pipelines: Metal on old Intel Macs
++/// (Big Sur) fails to compile any of them. Probed once.
++pub fn compute_supported(device: &wgpu::Device) -> bool {
++    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *SUPPORTED.get_or_init(|| {
++        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("vv-render compute probe"),
++            source: wgpu::ShaderSource::Wgsl(
++                "@group(0) @binding(0) var<storage, read_write> out: array<u32>;
++                @compute @workgroup_size(64)
++                fn main(@builtin(global_invocation_id) id: vec3<u32>) {
++                    if id.x < arrayLength(&out) { out[id.x] = id.x; }
++                }"
++                .into(),
++            ),
++        });
++        try_compute_pipeline(
++            device,
++            &wgpu::ComputePipelineDescriptor {
++                label: Some("vv-render compute probe"),
++                layout: None,
++                module: &module,
++                entry_point: Some("main"),
++                compilation_options: Default::default(),
++                cache: None,
++            },
++        )
++        .is_some()
++    })
++}
++
++/// `create_compute_pipeline`, but a pipeline the driver cannot compile is
++/// `None` instead of a fatal wgpu error.
++fn try_compute_pipeline(
++    device: &wgpu::Device,
++    desc: &wgpu::ComputePipelineDescriptor,
++) -> Option<wgpu::ComputePipeline> {
++    let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
++    let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
++    let pipeline = device.create_compute_pipeline(desc);
++    let internal = pollster::block_on(internal.pop());
++    let validation = pollster::block_on(validation.pop());
++    match internal.or(validation) {
++        None => Some(pipeline),
++        Some(error) => {
++            eprintln!(
++                "vv-render: {:?} unavailable, using the CPU instead: {error}",
++                desc.label.unwrap_or("compute pipeline")
++            );
++            None
++        }
++    }
++}
++
++/// CPU version of rgba_to_i420.wgsl (without the dither), for GPUs without
++/// compute shaders.
++fn rgba_to_i420(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
++    let (w, h) = (width as usize, height as usize);
++    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
++    let pixel = |x: usize, y: usize| {
++        let i = (y.min(h - 1) * w + x.min(w - 1)) * 4;
++        [rgba[i], rgba[i + 1], rgba[i + 2]].map(|c| f32::from(c) / 255.0)
++    };
++    let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
++    let byte = |v: f32| v.round().clamp(0.0, 255.0) as u8;
++    let mut out = Vec::with_capacity(w * h + 2 * cw * ch);
++    for y in 0..h {
++        for x in 0..w {
++            out.push(byte(16.0 + 219.0 * luma(pixel(x, y))));
++        }
++    }
++    let mut v_plane = Vec::with_capacity(cw * ch);
++    for y in 0..ch {
++        for x in 0..cw {
++            let mut c = [0.0f32; 3];
++            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
++                let p = pixel(2 * x + dx, 2 * y + dy);
++                for k in 0..3 {
++                    c[k] += p[k] * 0.25;
++                }
++            }
++            let l = luma(c);
++            out.push(byte(128.0 + 224.0 * (c[2] - l) / 1.8556));
++            v_plane.push(byte(128.0 + 224.0 * (c[0] - l) / 1.5748));
++        }
++    }
++    out.extend(v_plane);
++    out
++}
++
  pub fn device_limits(adapter: &wgpu::Adapter) -> wgpu::Limits {
      wgpu::Limits {
          max_texture_dimension_2d: 8192,
-@@ -1196,7 +1209,10 @@ impl Compositor {
+@@ -1096,14 +1199,17 @@ impl Compositor {
+                 .into(),
+             ),
+         });
+-        let i420_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+-            label: Some("vv-render rgba->i420 pipeline"),
+-            layout: None,
+-            module: &i420_shader,
+-            entry_point: Some("main"),
+-            compilation_options: Default::default(),
+-            cache: None,
+-        });
++        let i420_pipeline = try_compute_pipeline(
++            &device,
++            &wgpu::ComputePipelineDescriptor {
++                label: Some("vv-render rgba->i420 pipeline"),
++                layout: None,
++                module: &i420_shader,
++                entry_point: Some("main"),
++                compilation_options: Default::default(),
++                cache: None,
++            },
++        );
+ 
+         let compositor = Self {
+             device,
+@@ -1196,7 +1302,10 @@ impl Compositor {
      /// for the app today and for the tests.
      pub fn new_headless_with_precision(precision: ProcessingPrecision) -> Self {
          let (adapter, (device, queue)) = pollster::block_on(async {
@@ -70,8 +205,50 @@ index 95c31af..b0189a4 100644
              let adapter = instance
                  .request_adapter(&wgpu::RequestAdapterOptions::default())
                  .await
+@@ -1217,6 +1326,10 @@ impl Compositor {
+     /// Like `render_layers`, but dense I420 BT.709 limited: doing the conversion on
+     /// the GPU saves doing it on the CPU and halves the readback.
+     pub fn render_layers_i420(&self, layers: &[Layer], output: OutputFrame) -> Vec<u8> {
++        let Some(i420_pipeline) = &self.i420_pipeline else {
++            let rgba = self.render_layers(layers, output);
++            return rgba_to_i420(&rgba, output.width, output.height);
++        };
+         const WORKGROUP: u32 = 256;
+         const MAX_GROUPS_PER_DIM: u32 = 65535;
+ 
+@@ -1267,7 +1380,7 @@ impl Compositor {
+         let texture_view = work.create_view(&wgpu::TextureViewDescriptor::default());
+         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+             label: Some("vv-render i420 bind group"),
+-            layout: &self.i420_pipeline.get_bind_group_layout(0),
++            layout: &i420_pipeline.get_bind_group_layout(0),
+             entries: &[
+                 wgpu::BindGroupEntry {
+                     binding: 0,
+@@ -1294,7 +1407,7 @@ impl Compositor {
+                 label: Some("vv-render i420 pass"),
+                 timestamp_writes: None,
+             });
+-            pass.set_pipeline(&self.i420_pipeline);
++            pass.set_pipeline(i420_pipeline);
+             pass.set_bind_group(0, &bind_group, &[]);
+             pass.dispatch_workgroups(groups_x, groups_y, 1);
+         }
+@@ -1411,6 +1524,12 @@ impl Compositor {
+         progress: f32,
+         output: OutputFrame,
+     ) -> PooledTexture {
++        if !compute_supported(&self.device) {
++            // The optical flow needs compute shaders: a plain cut at the midpoint.
++            let side = if progress < 0.5 { from } else { to };
++            return self
++                .render_layers_to_owned_texture_transparent(std::slice::from_ref(side), output);
++        }
+         let a = self.compose(std::slice::from_ref(from), output, TRANSPARENT);
+         let b = self.compose(std::slice::from_ref(to), output, TRANSPARENT);
+         let out = self.scratch_texture(output.width, output.height);
 diff --git a/crates/vv-render/src/lib.rs b/crates/vv-render/src/lib.rs
-index ef3cfb0..45a107e 100644
+index ef3cfb0..62be465 100644
 --- a/crates/vv-render/src/lib.rs
 +++ b/crates/vv-render/src/lib.rs
 @@ -8,7 +8,7 @@ pub mod text;
@@ -79,7 +256,7 @@ index ef3cfb0..45a107e 100644
  pub use compositor::{
      Compositor, Layer, LayerContent, OutputFrame, PooledTexture, YuvChroma, YuvFrame,
 -    device_limits, fit_output_size,
-+    device_limits, fit_output_size, instance_flags,
++    compute_supported, device_limits, fit_output_size, instance_flags,
  };
  pub use scopes::{ScopeKind, Scopes};
  /// Re-exported: whoever owns a texture for `LayerContent::Texture` must use the
