@@ -1,5 +1,5 @@
 #!/bin/bash
-# Venturi.app + .dmg for macOS (Apple Silicon), with FFmpeg (libx264,
+# Venturi.app + .dmg for macOS (the host architecture), with FFmpeg (libx264,
 # VideoToolbox) and libx264 bundled in Contents/Frameworks. Must run on a Mac
 # with the Xcode command line tools; the app is signed ad-hoc only.
 #
@@ -12,9 +12,13 @@ if [ "$(uname -s)" != Darwin ]; then
     exit 1
 fi
 
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
-
 ARCH="$(uname -m)"
+# Intel builds also cover Big Sur, the last release on many Intel Macs.
+if [ "$ARCH" = x86_64 ]; then
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+else
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}"
+fi
 mkdir -p "${CARGO_TARGET_DIR:-target}"
 TARGET_DIR="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)"
 FFMPEG_PREFIX="$TARGET_DIR/ffmpeg-shared"

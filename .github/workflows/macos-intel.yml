@@ -1,0 +1,42 @@
+name: macOS Intel
+
+# Intel build (x86_64, macOS 11 Big Sur and later). Run manually from the
+# Actions tab; the dmg is left as an artifact of the run.
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-intel:
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build tools
+        run: brew install pkgconf meson ninja
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/cache@v6
+        with:
+          path: target/ffmpeg-shared
+          key: ffmpeg-${{ runner.os }}-${{ runner.arch }}-bigsur-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      - name: Build
+        run: scripts/build-macos.sh
+
+      - name: Check architecture and minimum macOS
+        run: |
+          for f in target/macos/Venturi.app/Contents/MacOS/vv-app target/macos/Venturi.app/Contents/Frameworks/*.dylib; do
+            [ "$(lipo -archs "$f")" = x86_64 ] || { echo "$f is not x86_64"; exit 1; }
+            minos=$(vtool -show-build "$f" | awk '/minos/ { print $2 }')
+            echo "$(basename "$f"): minos $minos"
+            [ "${minos%%.*}" -le 11 ] || { echo "$f needs macOS $minos"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: Venturi-macos-x86_64
+          path: target/macos/Venturi-*.dmg
+          if-no-files-found: error

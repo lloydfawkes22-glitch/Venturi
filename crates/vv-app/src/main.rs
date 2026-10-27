@@ -4966,19 +4966,30 @@ fn main() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
+    let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew {
+        device_descriptor: std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
+            label: Some("egui wgpu device"),
+            required_limits: vv_render::device_limits(adapter),
+            ..Default::default()
+        }),
+        ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+    };
+    // Metal's compiler on old Intel Macs (Big Sur) aborts on wgpu's
+    // indirect-call validation shaders and the device is lost before the
+    // window opens. Venturi issues no indirect calls.
+    // WGPU_VALIDATION_INDIRECT_CALL=1 still turns it back on.
+    if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        let flags = &mut wgpu_setup.instance_descriptor.flags;
+        *flags = flags
+            .difference(wgpu::InstanceFlags::VALIDATION_INDIRECT_CALL)
+            .with_env();
+    }
+
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         viewport,
         wgpu_options: eframe::WgpuConfiguration {
-            wgpu_setup: eframe::egui_wgpu::WgpuSetupCreateNew {
-                device_descriptor: std::sync::Arc::new(|adapter| wgpu::DeviceDescriptor {
-                    label: Some("egui wgpu device"),
-                    required_limits: vv_render::device_limits(adapter),
-                    ..Default::default()
-                }),
-                ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
-            }
-            .into(),
+            wgpu_setup: wgpu_setup.into(),
             ..Default::default()
         },
         ..Default::default()
